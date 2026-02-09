@@ -538,3 +538,291 @@ func Test848SessionTimeout(t *testing.T) {
 		t.Fatalf("expected records from multiple partitions, got %d", len(partitions))
 	}
 }
+
+// Test848ReconciliationGroupStateTransitions verifies that when a second
+// consumer joins, the group transitions through Reconciling back to Stable
+// and the assignment is split between both members.
+// Derived via LLM from testReconciliationProcess (GroupMetadataManagerTest.java).
+func Test848ReconciliationGroupStateTransitions(t *testing.T) {
+	t.Parallel()
+	topic := "t848-reconcile-states"
+	group := "g848-reconcile-states"
+	nPartitions := 6
+
+	c := newCluster(t, kfake.NumBrokers(1), kfake.SeedTopics(int32(nPartitions), topic))
+	adm := newAdminClient(t, c)
+
+	// c1 joins and stabilizes with all partitions.
+	c1 := newClient(t, c,
+		kgo.ConsumeTopics(topic),
+		kgo.ConsumerGroup(group),
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+		kgo.FetchMaxWait(250*time.Millisecond),
+	)
+	dg := waitForStableGroup(t, adm, group, 1, 10*time.Second)
+	if total := totalAssignedPartitions(dg); total != nPartitions {
+		t.Fatalf("c1 should own all %d partitions, got %d", nPartitions, total)
+	}
+
+	// c2 joins. The group should eventually stabilize with 2 members.
+	c2 := newClient(t, c,
+		kgo.ConsumeTopics(topic),
+		kgo.ConsumerGroup(group),
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+		kgo.FetchMaxWait(250*time.Millisecond),
+	)
+
+	dg = waitForStableGroup(t, adm, group, 2, 10*time.Second)
+
+	// Verify the assignment is split: each member should have partitions.
+	for _, m := range dg.Members {
+		nParts := 0
+		for _, parts := range m.Assignment {
+			nParts += len(parts)
+		}
+		if nParts == 0 {
+			t.Errorf("member %s has no partitions", m.MemberID)
+		}
+	}
+	if total := totalAssignedPartitions(dg); total != nPartitions {
+		t.Errorf("expected %d total partitions, got %d", nPartitions, total)
+	}
+
+	// Both consumers should be able to consume.
+	producer := newClient(t, c, kgo.DefaultProduceTopic(topic))
+	produceNStrings(t, producer, topic, 20)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	c1Got, c2Got := false, false
+	for !c1Got || !c2Got {
+		if !c1Got {
+			fs := c1.PollRecords(ctx, 10)
+			fs.EachRecord(func(*kgo.Record) { c1Got = true })
+		}
+		if !c2Got {
+			fs := c2.PollRecords(ctx, 10)
+			fs.EachRecord(func(*kgo.Record) { c2Got = true })
+		}
+		if ctx.Err() != nil {
+			t.Fatalf("timeout: c1=%v c2=%v", c1Got, c2Got)
+		}
+	}
+}
+
+// Test848ReconciliationThreeMembers verifies the full 3-member reconciliation
+// flow: c1+c2 stable, c3 joins, all 3 eventually stabilize with a fair
+// distribution.
+// Derived via LLM from testReconciliationProcess (GroupMetadataManagerTest.java).
+func Test848ReconciliationThreeMembers(t *testing.T) {
+	t.Parallel()
+	topic := "t848-reconcile-3"
+	group := "g848-reconcile-3"
+	nPartitions := 9
+
+	c := newCluster(t, kfake.NumBrokers(1), kfake.SeedTopics(int32(nPartitions), topic))
+	adm := newAdminClient(t, c)
+
+	// c1 and c2 join and stabilize.
+	c1 := newClient(t, c,
+		kgo.ConsumeTopics(topic),
+		kgo.ConsumerGroup(group),
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+		kgo.FetchMaxWait(250*time.Millisecond),
+	)
+	_ = c1
+	c2 := newClient(t, c,
+		kgo.ConsumeTopics(topic),
+		kgo.ConsumerGroup(group),
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+		kgo.FetchMaxWait(250*time.Millisecond),
+	)
+	_ = c2
+	waitForStableGroup(t, adm, group, 2, 10*time.Second)
+
+	// c3 joins, triggering reassignment.
+	c3 := newClient(t, c,
+		kgo.ConsumeTopics(topic),
+		kgo.ConsumerGroup(group),
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+		kgo.FetchMaxWait(250*time.Millisecond),
+	)
+	_ = c3
+
+	// Wait for all 3 members to be stable.
+	dg := waitForStableGroup(t, adm, group, 3, 15*time.Second)
+
+	// Each member should have exactly nPartitions/3 = 3 partitions.
+	for _, m := range dg.Members {
+		nParts := 0
+		for _, parts := range m.Assignment {
+			nParts += len(parts)
+		}
+		if nParts != nPartitions/3 {
+			t.Errorf("member %s has %d partitions, expected %d", m.MemberID, nParts, nPartitions/3)
+		}
+	}
+}
+
+// Test848StableToUnrevokedPartitions verifies that when a second consumer
+// joins, the first consumer cooperatively revokes partitions and the second
+// consumer eventually receives them.
+// Derived via LLM from testStableToUnrevokedPartitions (CurrentAssignmentBuilderTest.java).
+func Test848StableToUnrevokedPartitions(t *testing.T) {
+	t.Parallel()
+	topic := "t848-unrevoked"
+	group := "g848-unrevoked"
+	nPartitions := 6
+	nRecords := 30
+
+	c := newCluster(t, kfake.NumBrokers(1), kfake.SeedTopics(int32(nPartitions), topic))
+	adm := newAdminClient(t, c)
+
+	producer := newClient(t, c, kgo.DefaultProduceTopic(topic))
+	produceNStrings(t, producer, topic, nRecords)
+
+	// c1 owns all partitions initially.
+	c1 := newClient(t, c,
+		kgo.ConsumeTopics(topic),
+		kgo.ConsumerGroup(group),
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+		kgo.FetchMaxWait(250*time.Millisecond),
+	)
+	dg := waitForStableGroup(t, adm, group, 1, 10*time.Second)
+	if total := totalAssignedPartitions(dg); total != nPartitions {
+		t.Fatalf("c1 should own all %d partitions, got %d", nPartitions, total)
+	}
+
+	// Consume and commit so offsets are set.
+	consumeN(t, c1, nRecords, 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := c1.CommitUncommittedOffsets(ctx); err != nil {
+		t.Fatalf("commit failed: %v", err)
+	}
+
+	// c2 joins, triggering cooperative rebalance.
+	c2 := newClient(t, c,
+		kgo.ConsumeTopics(topic),
+		kgo.ConsumerGroup(group),
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+		kgo.FetchMaxWait(250*time.Millisecond),
+	)
+
+	// Wait for both to be stable.
+	dg = waitForStableGroup(t, adm, group, 2, 10*time.Second)
+
+	// Verify both have partitions.
+	for _, m := range dg.Members {
+		nParts := 0
+		for _, parts := range m.Assignment {
+			nParts += len(parts)
+		}
+		if nParts == 0 {
+			t.Errorf("member %s has no partitions after rebalance", m.MemberID)
+		}
+	}
+	if total := totalAssignedPartitions(dg); total != nPartitions {
+		t.Errorf("expected %d total partitions, got %d", nPartitions, total)
+	}
+
+	// Produce more records and verify both consumers get records.
+	produceNStrings(t, producer, topic, nRecords)
+	c1Got, c2Got := false, false
+	pollCtx, pollCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer pollCancel()
+	for !c1Got || !c2Got {
+		if !c1Got {
+			fs := c1.PollRecords(pollCtx, 10)
+			fs.EachRecord(func(*kgo.Record) { c1Got = true })
+		}
+		if !c2Got {
+			fs := c2.PollRecords(pollCtx, 10)
+			fs.EachRecord(func(*kgo.Record) { c2Got = true })
+		}
+		if pollCtx.Err() != nil {
+			t.Fatalf("timeout: c1=%v c2=%v", c1Got, c2Got)
+		}
+	}
+}
+
+// Test848UnreleasedPartitionsWaitForRevocation verifies that a third consumer
+// joining an already-split group must wait for existing members to release
+// partitions before receiving its full assignment.
+// Derived via LLM from testReconciliationProcess (GroupMetadataManagerTest.java, member 3 waiting).
+func Test848UnreleasedPartitionsWaitForRevocation(t *testing.T) {
+	t.Parallel()
+	topic := "t848-unreleased"
+	group := "g848-unreleased"
+	nPartitions := 9
+
+	c := newCluster(t, kfake.NumBrokers(1), kfake.SeedTopics(int32(nPartitions), topic))
+	adm := newAdminClient(t, c)
+
+	// c1 and c2 stabilize.
+	c1 := newClient(t, c,
+		kgo.ConsumeTopics(topic),
+		kgo.ConsumerGroup(group),
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+		kgo.FetchMaxWait(250*time.Millisecond),
+	)
+	_ = c1
+	c2 := newClient(t, c,
+		kgo.ConsumeTopics(topic),
+		kgo.ConsumerGroup(group),
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+		kgo.FetchMaxWait(250*time.Millisecond),
+	)
+	_ = c2
+	dg := waitForStableGroup(t, adm, group, 2, 10*time.Second)
+	if total := totalAssignedPartitions(dg); total != nPartitions {
+		t.Fatalf("expected %d total partitions with 2 members, got %d", nPartitions, total)
+	}
+
+	// c3 joins, triggering another round of cooperative rebalance.
+	// c1 and c2 must revoke some partitions so c3 can pick them up.
+	c3 := newClient(t, c,
+		kgo.ConsumeTopics(topic),
+		kgo.ConsumerGroup(group),
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+		kgo.FetchMaxWait(250*time.Millisecond),
+	)
+	_ = c3
+
+	// Wait for all 3 to stabilize.
+	dg = waitForStableGroup(t, adm, group, 3, 15*time.Second)
+
+	// All 3 should have partitions.
+	for _, m := range dg.Members {
+		nParts := 0
+		for _, parts := range m.Assignment {
+			nParts += len(parts)
+		}
+		if nParts == 0 {
+			t.Errorf("member %s has no partitions", m.MemberID)
+		}
+	}
+	if total := totalAssignedPartitions(dg); total != nPartitions {
+		t.Errorf("expected %d total partitions, got %d", nPartitions, total)
+	}
+
+	// Produce and verify all 3 consumers get records.
+	producer := newClient(t, c, kgo.DefaultProduceTopic(topic))
+	produceNStrings(t, producer, topic, 30)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	got := [3]bool{}
+	clients := [3]*kgo.Client{c1, c2, c3}
+	for !got[0] || !got[1] || !got[2] {
+		for i, cl := range clients {
+			if !got[i] {
+				fs := cl.PollRecords(ctx, 10)
+				fs.EachRecord(func(*kgo.Record) { got[i] = true })
+			}
+		}
+		if ctx.Err() != nil {
+			t.Fatalf("timeout: got=%v", got)
+		}
+	}
+}

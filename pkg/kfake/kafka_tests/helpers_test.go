@@ -96,3 +96,37 @@ func consumeN(t *testing.T, cl *kgo.Client, n int, timeout time.Duration) []*kgo
 	}
 	return records
 }
+
+// waitForStableGroup polls DescribeConsumerGroups until the group is Stable
+// with the expected number of members, then returns the described group.
+func waitForStableGroup(t *testing.T, adm *kadm.Client, group string, nMembers int, timeout time.Duration) kadm.DescribedConsumerGroup {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	for {
+		described, err := adm.DescribeConsumerGroups(ctx, group)
+		if err != nil {
+			t.Fatalf("describe failed: %v", err)
+		}
+		dg := described[group]
+		if dg.State == "Stable" && len(dg.Members) == nMembers {
+			return dg
+		}
+		if ctx.Err() != nil {
+			t.Fatalf("timeout waiting for stable group %q with %d members (state=%s, members=%d)", group, nMembers, dg.State, len(dg.Members))
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// totalAssignedPartitions returns the total number of partitions assigned
+// across all members of a described consumer group.
+func totalAssignedPartitions(dg kadm.DescribedConsumerGroup) int {
+	n := 0
+	for _, m := range dg.Members {
+		for _, parts := range m.Assignment {
+			n += len(parts)
+		}
+	}
+	return n
+}

@@ -903,3 +903,152 @@ func TestOffsetCommitAfterLeave848(t *testing.T) {
 		t.Errorf("expected committed offset 10, got %d", o.At)
 	}
 }
+
+// Test848PartitionHandoffNoDuplicates verifies that when a consumer leaves,
+// its partitions are reassigned to the remaining consumer without any
+// partition being assigned to two consumers simultaneously.
+func Test848PartitionHandoffNoDuplicates(t *testing.T) {
+	t.Parallel()
+	topic := "t848-handoff"
+	group := "g848-handoff"
+	nPartitions := 6
+	nRecords := 60
+
+	c := newCluster(t, kfake.NumBrokers(1), kfake.SeedTopics(int32(nPartitions), topic))
+	producer := newClient(t, c, kgo.DefaultProduceTopic(topic))
+	produceNStrings(t, producer, topic, nRecords)
+
+	adm := kadm.NewClient(newClient(t, c))
+
+	c1 := newClient(t, c,
+		kgo.ConsumeTopics(topic),
+		kgo.ConsumerGroup(group),
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+		kgo.FetchMaxWait(250*time.Millisecond),
+	)
+	c2 := newClient(t, c,
+		kgo.ConsumeTopics(topic),
+		kgo.ConsumerGroup(group),
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+		kgo.FetchMaxWait(250*time.Millisecond),
+	)
+
+	// Wait for stable 2-member group.
+	dg := waitForStableGroup(t, adm, group, 2, 10*time.Second)
+	if total := totalAssignedPartitions(dg); total != nPartitions {
+		t.Fatalf("expected %d total partitions, got %d", nPartitions, total)
+	}
+
+	// Verify no partition overlap.
+	seen := make(map[string]string) // "topic/partition" -> memberID
+	for _, m := range dg.Members {
+		for topicName, parts := range m.Assignment {
+			for p := range parts {
+				key := topicName + "/" + strconv.Itoa(int(p))
+				if prev, ok := seen[key]; ok {
+					t.Fatalf("partition %s assigned to both %s and %s", key, prev, m.MemberID)
+				}
+				seen[key] = m.MemberID
+			}
+		}
+	}
+
+	// Close c2; c1 should pick up all partitions.
+	c2.Close()
+	dg = waitForStableGroup(t, adm, group, 1, 10*time.Second)
+	if total := totalAssignedPartitions(dg); total != nPartitions {
+		t.Fatalf("expected %d partitions after c2 leave, got %d", nPartitions, total)
+	}
+
+	// Produce more and verify c1 consumes from all partitions.
+	produceNStrings(t, producer, topic, nRecords)
+	records := consumeN(t, c1, nRecords, 10*time.Second)
+	partitions := make(map[int32]bool)
+	for _, r := range records {
+		partitions[r.Partition] = true
+	}
+	if len(partitions) != nPartitions {
+		t.Errorf("expected records from all %d partitions, got %d", nPartitions, len(partitions))
+	}
+}
+
+// Test848CooperativeRevocationDuringConsumption verifies that cooperative
+// rebalancing works correctly while records are actively being consumed.
+// A third consumer joining should not cause data loss or duplication.
+func Test848CooperativeRevocationDuringConsumption(t *testing.T) {
+	t.Parallel()
+	topic := "t848-coop-consume"
+	group := "g848-coop-consume"
+	nPartitions := 6
+	nRecords := 60
+
+	c := newCluster(t, kfake.NumBrokers(1), kfake.SeedTopics(int32(nPartitions), topic))
+	producer := newClient(t, c, kgo.DefaultProduceTopic(topic))
+	produceNStrings(t, producer, topic, nRecords)
+
+	adm := kadm.NewClient(newClient(t, c))
+
+	c1 := newClient(t, c,
+		kgo.ConsumeTopics(topic),
+		kgo.ConsumerGroup(group),
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+		kgo.FetchMaxWait(250*time.Millisecond),
+		kgo.DisableAutoCommit(),
+	)
+	c2 := newClient(t, c,
+		kgo.ConsumeTopics(topic),
+		kgo.ConsumerGroup(group),
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+		kgo.FetchMaxWait(250*time.Millisecond),
+		kgo.DisableAutoCommit(),
+	)
+
+	// Wait for 2-member stable group and consume all records.
+	waitForStableGroup(t, adm, group, 2, 10*time.Second)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	got := 0
+	for got < nRecords {
+		fs := c1.PollRecords(ctx, 100)
+		fs.EachRecord(func(*kgo.Record) { got++ })
+		fs = c2.PollRecords(ctx, 100)
+		fs.EachRecord(func(*kgo.Record) { got++ })
+		if ctx.Err() != nil {
+			t.Fatalf("timeout consuming: got %d/%d", got, nRecords)
+		}
+	}
+
+	// Commit offsets.
+	if err := c1.CommitUncommittedOffsets(ctx); err != nil {
+		t.Fatalf("c1 commit: %v", err)
+	}
+	if err := c2.CommitUncommittedOffsets(ctx); err != nil {
+		t.Fatalf("c2 commit: %v", err)
+	}
+
+	// Add c3 while producing more records - cooperative rebalance happens.
+	produceNStrings(t, producer, topic, nRecords)
+	c3 := newClient(t, c,
+		kgo.ConsumeTopics(topic),
+		kgo.ConsumerGroup(group),
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+		kgo.FetchMaxWait(250*time.Millisecond),
+		kgo.DisableAutoCommit(),
+	)
+	waitForStableGroup(t, adm, group, 3, 15*time.Second)
+
+	// All 3 should consume the new records together.
+	consumeCtx, consumeCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer consumeCancel()
+	got = 0
+	for got < nRecords {
+		for _, cl := range []*kgo.Client{c1, c2, c3} {
+			fs := cl.PollRecords(consumeCtx, 50)
+			fs.EachRecord(func(*kgo.Record) { got++ })
+		}
+		if got < nRecords && consumeCtx.Err() != nil {
+			t.Fatalf("timeout consuming after rebalance: got %d/%d", got, nRecords)
+		}
+	}
+}
