@@ -313,3 +313,97 @@ func TestPositionAndCommit(t *testing.T) {
 		t.Errorf("expected committed offset >= 5, got %d", o.At)
 	}
 }
+
+// TestCommitThenCloseRace verifies that offsets committed just before
+// Close() are preserved even though LeaveGroup removes the member.
+// The race is: CommitUncommittedOffsets followed by Close - the commit
+// may arrive at the broker after LeaveGroup removes the member.
+// Tests both classic and 848 consumer groups.
+// Derived from PlaintextConsumerCommitTest.testAutoCommitOnClose.
+func TestCommitThenCloseRace(t *testing.T) {
+	t.Parallel()
+
+	t.Run("848", func(t *testing.T) {
+		t.Parallel()
+		topic := "commit-close-race-848"
+		group := "commit-close-race-848-group"
+		c := newCluster(t, kfake.NumBrokers(1), kfake.SeedTopics(1, topic))
+
+		producer := newClient(t, c, kgo.DefaultProduceTopic(topic))
+		produceNStrings(t, producer, topic, 10)
+
+		// 848 consumer via newClient.
+		consumer := newClient(t, c,
+			kgo.ConsumeTopics(topic),
+			kgo.ConsumerGroup(group),
+			kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+			kgo.DisableAutoCommit(),
+		)
+		consumeN(t, consumer, 10, 10*time.Second)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := consumer.CommitUncommittedOffsets(ctx); err != nil {
+			t.Fatalf("commit failed: %v", err)
+		}
+		consumer.Close()
+
+		// Verify committed offsets persist after close.
+		adm := newAdminClient(t, c)
+		fetched, err := adm.FetchOffsets(ctx, group)
+		if err != nil {
+			t.Fatalf("fetch offsets failed: %v", err)
+		}
+		o, ok := fetched.Lookup(topic, 0)
+		if !ok {
+			t.Fatal("no committed offset found after commit then close")
+		}
+		if o.At != 10 {
+			t.Errorf("expected committed offset 10, got %d", o.At)
+		}
+	})
+
+	t.Run("classic", func(t *testing.T) {
+		t.Parallel()
+		topic := "commit-close-race-classic"
+		group := "commit-close-race-classic-group"
+		c := newCluster(t, kfake.NumBrokers(1), kfake.SeedTopics(1, topic))
+
+		producer := newClient(t, c, kgo.DefaultProduceTopic(topic))
+		produceNStrings(t, producer, topic, 10)
+
+		// Classic group (no 848 opt-in).
+		cl, err := kgo.NewClient(
+			kgo.SeedBrokers(c.ListenAddrs()...),
+			kgo.ConsumerGroup(group),
+			kgo.ConsumeTopics(topic),
+			kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+			kgo.DisableAutoCommit(),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		consumeN(t, cl, 10, 10*time.Second)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := cl.CommitUncommittedOffsets(ctx); err != nil {
+			t.Fatalf("commit failed: %v", err)
+		}
+		cl.Close()
+
+		// Verify committed offsets persist after close.
+		adm := newAdminClient(t, c)
+		fetched, err := adm.FetchOffsets(ctx, group)
+		if err != nil {
+			t.Fatalf("fetch offsets failed: %v", err)
+		}
+		o, ok := fetched.Lookup(topic, 0)
+		if !ok {
+			t.Fatal("no committed offset found after commit then close")
+		}
+		if o.At != 10 {
+			t.Errorf("expected committed offset 10, got %d", o.At)
+		}
+	})
+}

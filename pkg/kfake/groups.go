@@ -1065,18 +1065,10 @@ func (g *group) handleOffsetCommit(creq *clientReq) (*kmsg.OffsetCommitResponse,
 			fillOffsetCommit(req, resp, kerr.IllegalGeneration.Code)
 			return resp, false
 		}
-	} else {
-		if req.MemberID != "" {
-			fillOffsetCommit(req, resp, kerr.UnknownMemberID.Code)
-			return resp, false
-		}
-		if req.Generation != -1 {
-			fillOffsetCommit(req, resp, kerr.IllegalGeneration.Code)
-			return resp, false
-		}
-		if g.state != groupEmpty {
-			panic("invalid state: no members, but group not empty")
-		}
+	} else if req.Generation >= 0 {
+		// Empty group: only accept simple commits (generation < 0).
+		fillOffsetCommit(req, resp, kerr.IllegalGeneration.Code)
+		return resp, false
 	}
 
 	switch g.state {
@@ -1457,7 +1449,7 @@ func (gs *groups) handleConsumerGroupDescribe(creq *clientReq) *kmsg.ConsumerGro
 			continue
 		}
 		g, ok := gs.gs[rg]
-		if !ok || g.typ != "consumer" {
+		if !ok {
 			sg.ErrorCode = kerr.GroupIDNotFound.Code
 			if req.IncludeAuthorizedOperations {
 				sg.AuthorizedOperations = gs.c.groupAuthorizedOps(creq, rg)
@@ -1465,6 +1457,13 @@ func (gs *groups) handleConsumerGroupDescribe(creq *clientReq) *kmsg.ConsumerGro
 			continue
 		}
 		if !g.waitControl(func() {
+			if g.typ != "consumer" {
+				sg.ErrorCode = kerr.GroupIDNotFound.Code
+				if req.IncludeAuthorizedOperations {
+					sg.AuthorizedOperations = gs.c.groupAuthorizedOps(creq, rg)
+				}
+				return
+			}
 			sg.State = g.state.String()
 			sg.Epoch = g.generation
 			sg.AssignmentEpoch = g.generation
@@ -1964,8 +1963,15 @@ func (g *group) handleConsumerOffsetCommit(creq *clientReq) *kmsg.OffsetCommitRe
 		return resp
 	}
 
-	// KIP-1251: Generation is the member epoch; accept if <= member.memberEpoch.
-	if req.MemberID != "" {
+	// Empty group with negative epoch: accept without validation
+	// (admin / kadm commits).
+	if len(g.consumerMembers) == 0 && req.Generation < 0 {
+		// Fall through to commit.
+	} else if req.MemberID == "" {
+		fillOffsetCommit(req, resp, kerr.UnknownMemberID.Code)
+		return resp
+	} else {
+		// KIP-1251: Generation is the member epoch.
 		m, ok := g.consumerMembers[req.MemberID]
 		if !ok {
 			fillOffsetCommit(req, resp, kerr.UnknownMemberID.Code)

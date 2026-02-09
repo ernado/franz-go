@@ -778,3 +778,128 @@ func Test848UnsupportedAssignor(t *testing.T) {
 		t.Fatalf("expected UnsupportedAssignor, got %v", err)
 	}
 }
+
+// TestOffsetCommitAfterLeaveClassic verifies that an admin-style OffsetCommit
+// (empty memberID, generation -1) is accepted on an empty classic group after
+// all members have left.
+func TestOffsetCommitAfterLeaveClassic(t *testing.T) {
+	t.Parallel()
+	topic := "commit-after-leave"
+	group := "commit-after-leave-group"
+
+	c := newCluster(t, kfake.NumBrokers(1), kfake.SeedTopics(1, topic))
+	producer := newClient(t, c, kgo.DefaultProduceTopic(topic))
+	produceNStrings(t, producer, topic, 10)
+
+	// Classic group consumer.
+	cl, err := kgo.NewClient(
+		kgo.SeedBrokers(c.ListenAddrs()...),
+		kgo.ConsumerGroup(group),
+		kgo.ConsumeTopics(topic),
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+		kgo.DisableAutoCommit(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+	consumeN(t, cl, 10, 10*time.Second)
+
+	// Leave the group.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := cl.LeaveGroupContext(ctx); err != nil {
+		t.Fatalf("leave failed: %v", err)
+	}
+
+	// Admin-style commit: empty memberID, generation -1.
+	raw := newClient(t, c)
+	adm := kadm.NewClient(raw)
+	offsets := kadm.Offsets{}
+	offsets.Add(kadm.Offset{Topic: topic, Partition: 0, At: 10})
+	_, err = adm.CommitOffsets(ctx, group, offsets)
+	if err != nil {
+		t.Fatalf("admin commit failed: %v", err)
+	}
+
+	// Verify committed offsets.
+	fetched, err := adm.FetchOffsets(ctx, group)
+	if err != nil {
+		t.Fatalf("fetch offsets failed: %v", err)
+	}
+	o, ok := fetched.Lookup(topic, 0)
+	if !ok {
+		t.Fatal("no committed offset found after commit-after-leave")
+	}
+	if o.At != 10 {
+		t.Errorf("expected committed offset 10, got %d", o.At)
+	}
+}
+
+// TestOffsetCommitAfterLeave848 verifies that an admin-style OffsetCommit
+// (empty memberID, negative epoch) is accepted on an empty KIP-848 consumer
+// group after the member has left.
+func TestOffsetCommitAfterLeave848(t *testing.T) {
+	t.Parallel()
+	topic := "commit-after-leave-848"
+	group := "commit-after-leave-848-group"
+
+	c := newCluster(t, kfake.NumBrokers(1), kfake.SeedTopics(1, topic))
+	producer := newClient(t, c, kgo.DefaultProduceTopic(topic))
+	produceNStrings(t, producer, topic, 10)
+
+	// 848 consumer.
+	consumer := newClient(t, c,
+		kgo.ConsumeTopics(topic),
+		kgo.ConsumerGroup(group),
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+		kgo.DisableAutoCommit(),
+	)
+	consumeN(t, consumer, 10, 10*time.Second)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Close the consumer (triggers leave via heartbeat with epoch -1).
+	consumer.Close()
+
+	// Admin-style commit with v9 OffsetCommit: empty memberID, generation -1.
+	commitReq := kmsg.NewOffsetCommitRequest()
+	commitReq.Version = 9
+	commitReq.Group = group
+	commitReq.Generation = -1
+	rt := kmsg.NewOffsetCommitRequestTopic()
+	rt.Topic = topic
+	rp := kmsg.NewOffsetCommitRequestTopicPartition()
+	rp.Partition = 0
+	rp.Offset = 10
+	rt.Partitions = append(rt.Partitions, rp)
+	commitReq.Topics = append(commitReq.Topics, rt)
+
+	raw := newClient(t, c)
+	commitResp, err := commitReq.RequestWith(ctx, raw)
+	if err != nil {
+		t.Fatalf("commit request failed: %v", err)
+	}
+	for _, t2 := range commitResp.Topics {
+		for _, p := range t2.Partitions {
+			if err := kerr.ErrorForCode(p.ErrorCode); err != nil {
+				t.Fatalf("commit partition %d error: %v", p.Partition, err)
+			}
+		}
+	}
+
+	// Verify committed offsets.
+	adm := kadm.NewClient(raw)
+	fetched, err := adm.FetchOffsets(ctx, group)
+	if err != nil {
+		t.Fatalf("fetch offsets failed: %v", err)
+	}
+	o, ok := fetched.Lookup(topic, 0)
+	if !ok {
+		t.Fatal("no committed offset found after commit-after-leave")
+	}
+	if o.At != 10 {
+		t.Errorf("expected committed offset 10, got %d", o.At)
+	}
+}
