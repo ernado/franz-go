@@ -3,6 +3,7 @@ package kfake_test
 import (
 	"context"
 	"errors"
+	"slices"
 	"strconv"
 	"testing"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kfake"
 	"github.com/twmb/franz-go/pkg/kgo"
+	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
 func newCluster(t *testing.T, opts ...kfake.Opt) *kfake.Cluster {
@@ -76,6 +78,36 @@ func consumeN(t *testing.T, cl *kgo.Client, n int, timeout time.Duration) []*kgo
 		})
 	}
 	return records
+}
+
+func waitForStableGroup(t *testing.T, adm *kadm.Client, group string, nMembers int, timeout time.Duration) kadm.DescribedConsumerGroup {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	for {
+		described, err := adm.DescribeConsumerGroups(ctx, group)
+		if err != nil {
+			t.Fatalf("describe failed: %v", err)
+		}
+		dg := described[group]
+		if dg.State == "Stable" && len(dg.Members) == nMembers {
+			return dg
+		}
+		if ctx.Err() != nil {
+			t.Fatalf("timeout waiting for stable group %q with %d members (state=%s, members=%d)", group, nMembers, dg.State, len(dg.Members))
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func totalAssignedPartitions(dg kadm.DescribedConsumerGroup) int {
+	n := 0
+	for _, m := range dg.Members {
+		for _, parts := range m.Assignment {
+			n += len(parts)
+		}
+	}
+	return n
 }
 
 // Test848RegexSubscription verifies that server-side regex subscription
@@ -634,5 +666,115 @@ func Test848TopicCreatedAfterJoin(t *testing.T) {
 	}
 	if newTopicCount != nRecords {
 		t.Fatalf("expected %d records from new topic, got %d", nRecords, newTopicCount)
+	}
+}
+
+// Test848RangeAssignorContiguousBlocks verifies that when using the range
+// balancer, each consumer gets a contiguous block of partitions per topic.
+// Uses DescribeConsumerGroups to check the assignment directly rather than
+// inferring it from consumed records.
+func Test848RangeAssignorContiguousBlocks(t *testing.T) {
+	t.Parallel()
+	topic := "t848-range"
+	group := "g848-range"
+	nPartitions := 6
+
+	c := newCluster(t, kfake.NumBrokers(1), kfake.SeedTopics(int32(nPartitions), topic))
+	producer := newClient(t, c, kgo.DefaultProduceTopic(topic))
+	produceNStrings(t, producer, topic, 60)
+
+	// Two consumers using the range balancer.
+	c1 := newClient(t, c,
+		kgo.ConsumeTopics(topic),
+		kgo.ConsumerGroup(group),
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+		kgo.Balancers(kgo.RangeBalancer()),
+		kgo.FetchMaxWait(250*time.Millisecond),
+	)
+	c2 := newClient(t, c,
+		kgo.ConsumeTopics(topic),
+		kgo.ConsumerGroup(group),
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+		kgo.Balancers(kgo.RangeBalancer()),
+		kgo.FetchMaxWait(250*time.Millisecond),
+	)
+
+	// Wait for the group to stabilize with 2 members and verify
+	// the assignment via DescribeConsumerGroups.
+	adm := kadm.NewClient(newClient(t, c))
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	for {
+		described, err := adm.DescribeConsumerGroups(ctx, group)
+		if err != nil {
+			t.Fatalf("describe failed: %v", err)
+		}
+		dg := described[group]
+		if dg.State == "Stable" && len(dg.Members) == 2 {
+			// Verify each member's assignment is contiguous.
+			for _, m := range dg.Members {
+				for topicName, parts := range m.Assignment {
+					var ps []int32
+					for p := range parts {
+						ps = append(ps, p)
+					}
+					slices.Sort(ps)
+					for i := 1; i < len(ps); i++ {
+						if ps[i] != ps[i-1]+1 {
+							t.Errorf("member %s has non-contiguous partitions for %s: %v", m.MemberID, topicName, ps)
+						}
+					}
+				}
+			}
+			break
+		}
+		if ctx.Err() != nil {
+			t.Fatalf("timeout waiting for stable group with 2 members")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// Also confirm both consumers actually receive records.
+	c1Got, c2Got := false, false
+	for !c1Got || !c2Got {
+		if !c1Got {
+			fs := c1.PollRecords(ctx, 10)
+			fs.EachRecord(func(*kgo.Record) { c1Got = true })
+		}
+		if !c2Got {
+			fs := c2.PollRecords(ctx, 10)
+			fs.EachRecord(func(*kgo.Record) { c2Got = true })
+		}
+		if ctx.Err() != nil {
+			t.Fatalf("timeout waiting for both consumers to get records: c1=%v c2=%v", c1Got, c2Got)
+		}
+	}
+}
+
+// Test848UnsupportedAssignor verifies that an unknown server assignor
+// name is rejected with UnsupportedAssignor.
+func Test848UnsupportedAssignor(t *testing.T) {
+	t.Parallel()
+	group := "g848-bad-assignor"
+
+	c := newCluster(t, kfake.NumBrokers(1), kfake.SeedTopics(1, "t"))
+
+	// Send a raw ConsumerGroupHeartbeat with an unknown assignor.
+	cl := newClient(t, c)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req := kmsg.NewConsumerGroupHeartbeatRequest()
+	req.Group = group
+	req.MemberEpoch = 0
+	req.RebalanceTimeoutMillis = 5000
+	bad := "nonexistent"
+	req.ServerAssignor = &bad
+	req.SubscribedTopicNames = []string{"t"}
+	resp, err := req.RequestWith(ctx, cl)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	if err := kerr.ErrorForCode(resp.ErrorCode); !errors.Is(err, kerr.UnsupportedAssignor) {
+		t.Fatalf("expected UnsupportedAssignor, got %v", err)
 	}
 }

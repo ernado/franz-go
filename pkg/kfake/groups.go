@@ -1582,6 +1582,10 @@ func (g *group) consumerJoin(creq *clientReq, req *kmsg.ConsumerGroupHeartbeatRe
 		targetAssignment:   make(map[uuid][]int32),
 	}
 	if req.ServerAssignor != nil {
+		if !validServerAssignor(*req.ServerAssignor) {
+			resp.ErrorCode = kerr.UnsupportedAssignor.Code
+			return resp
+		}
 		m.serverAssignor = *req.ServerAssignor
 	}
 	if req.SubscribedTopicNames != nil {
@@ -1681,6 +1685,10 @@ func (g *group) consumerRegularHeartbeat(req *kmsg.ConsumerGroupHeartbeatRequest
 			needRecompute = true
 		}
 		if req.ServerAssignor != nil && *req.ServerAssignor != m.serverAssignor {
+			if !validServerAssignor(*req.ServerAssignor) {
+				resp.ErrorCode = kerr.UnsupportedAssignor.Code
+				return resp
+			}
 			m.serverAssignor = *req.ServerAssignor
 			g.assignorName = m.serverAssignor
 		}
@@ -1715,17 +1723,25 @@ func (g *group) consumerRegularHeartbeat(req *kmsg.ConsumerGroupHeartbeatRequest
 	return resp
 }
 
-// Uniform round-robin assignor. Uses the provided topic metadata
-// snapshot to resolve both explicit and regex subscriptions.
-// Updates targetAssignment on each consumerMember.
+// validServerAssignor returns whether the given assignor name is
+// supported for consumer groups. Only "uniform" and "range" are valid
+// ("simple" is for share groups only - KIP-932).
+func validServerAssignor(name string) bool {
+	return name == "uniform" || name == "range"
+}
+
+type assignorTP struct {
+	topic string
+	id    uuid
+	part  int32
+}
+
+// computeTargetAssignment resolves subscriptions against the topic
+// metadata snapshot and dispatches to the appropriate assignor based on
+// g.assignorName. Updates targetAssignment on each consumerMember.
 func (g *group) computeTargetAssignment(snap topicMetaSnap) {
-	type topicPartition struct {
-		topic string
-		id    uuid
-		part  int32
-	}
 	memberSubs := make(map[string]map[string]struct{}, len(g.consumerMembers))
-	var allTPs []topicPartition
+	var allTPs []assignorTP
 
 	subscribedSet := make(map[string]struct{})
 	for mid, m := range g.consumerMembers {
@@ -1751,12 +1767,12 @@ func (g *group) computeTargetAssignment(snap topicMetaSnap) {
 			continue
 		}
 		for p := int32(0); p < info.partitions; p++ {
-			allTPs = append(allTPs, topicPartition{topic: topic, id: info.id, part: p})
+			allTPs = append(allTPs, assignorTP{topic: topic, id: info.id, part: p})
 		}
 	}
 
 	// Sort deterministically: by topic name, then partition.
-	slices.SortFunc(allTPs, func(a, b topicPartition) int {
+	slices.SortFunc(allTPs, func(a, b assignorTP) int {
 		if c := cmp.Compare(a.topic, b.topic); c != 0 {
 			return c
 		}
@@ -1779,7 +1795,24 @@ func (g *group) computeTargetAssignment(snap topicMetaSnap) {
 		return
 	}
 
-	// Round-robin: iterate partitions, assign to next eligible member.
+	switch g.assignorName {
+	case "range":
+		g.assignRange(allTPs, memberIDs, memberSubs)
+	default: // "uniform" or "" (pre-assignor groups) - validated at heartbeat time
+		g.assignUniform(allTPs, memberIDs, memberSubs)
+	}
+
+	// Sort partition lists for determinism.
+	for _, m := range g.consumerMembers {
+		for id := range m.targetAssignment {
+			slices.Sort(m.targetAssignment[id])
+		}
+	}
+}
+
+// assignUniform distributes partitions round-robin across all eligible
+// members.
+func (g *group) assignUniform(allTPs []assignorTP, memberIDs []string, memberSubs map[string]map[string]struct{}) {
 	idx := 0
 	for _, tp := range allTPs {
 		startIdx := idx
@@ -1796,11 +1829,60 @@ func (g *group) computeTargetAssignment(snap topicMetaSnap) {
 			}
 		}
 	}
+}
 
-	// Sort partition lists for determinism.
-	for _, m := range g.consumerMembers {
-		for id := range m.targetAssignment {
-			slices.Sort(m.targetAssignment[id])
+// assignRange distributes contiguous partition ranges per topic. For
+// each topic, members subscribed to that topic (in sorted order) get
+// a contiguous block. If partitions don't divide evenly, the first
+// members get one extra partition.
+func (g *group) assignRange(allTPs []assignorTP, memberIDs []string, memberSubs map[string]map[string]struct{}) {
+	// Group TPs by topic. allTPs is sorted by (topic, partition),
+	// so partitions for each topic are contiguous.
+	type topicSlice struct {
+		topic      string
+		partitions []assignorTP
+	}
+	var topics []topicSlice
+	for i, tp := range allTPs {
+		if i == 0 || tp.topic != allTPs[i-1].topic {
+			topics = append(topics, topicSlice{topic: tp.topic})
+		}
+		topics[len(topics)-1].partitions = append(topics[len(topics)-1].partitions, tp)
+	}
+
+	for _, ts := range topics {
+		topic := ts.topic
+		partitions := ts.partitions
+
+		// Filter to members subscribed to this topic, preserving
+		// the sorted order from memberIDs.
+		var subs []string
+		for _, mid := range memberIDs {
+			if _, ok := memberSubs[mid][topic]; ok {
+				subs = append(subs, mid)
+			}
+		}
+		if len(subs) == 0 {
+			continue
+		}
+
+		numP := len(partitions)
+		numM := len(subs)
+		minQuota := numP / numM
+		extra := numP % numM
+		nextRange := 0
+
+		for _, mid := range subs {
+			quota := minQuota
+			if extra > 0 {
+				quota++
+				extra--
+			}
+			m := g.consumerMembers[mid]
+			for _, tp := range partitions[nextRange : nextRange+quota] {
+				m.targetAssignment[tp.id] = append(m.targetAssignment[tp.id], tp.part)
+			}
+			nextRange += quota
 		}
 	}
 }
