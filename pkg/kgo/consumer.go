@@ -182,6 +182,11 @@ type consumer struct {
 	bufferedRecords atomic.Int64
 	bufferedBytes   atomic.Int64
 
+	// backpressureMu guards backpressureCond, which is used to signal when
+	// buffered records/bytes drop below the configured limits.
+	backpressureMu   sync.Mutex
+	backpressureCond *sync.Cond
+
 	cl *Client
 
 	pausedMu sync.Mutex   // grabbed when updating paused
@@ -334,6 +339,7 @@ func (c *consumer) init(cl *Client) {
 	c.paused.Store(make(pausedTopics))
 	c.sourcesReadyCond = sync.NewCond(&c.sourcesReadyMu)
 	c.pollWaitC = sync.NewCond(&c.pollWaitMu)
+	c.backpressureCond = sync.NewCond(&c.backpressureMu)
 
 	if len(cl.cfg.topics) > 0 || len(cl.cfg.partitions) > 0 {
 		defer cl.triggerUpdateMetadataNow("querying metadata for consumer initialization") // we definitely want to trigger a metadata update
@@ -348,6 +354,68 @@ func (c *consumer) init(cl *Client) {
 
 func (c *consumer) consuming() bool {
 	return c.g != nil || c.d != nil
+}
+
+// signalBackpressure signals that records were unbuffered, allowing any
+// blocked fetches waiting for backpressure to proceed.
+func (c *consumer) signalBackpressure() {
+	c.backpressureMu.Lock()
+	c.backpressureCond.Broadcast()
+	c.backpressureMu.Unlock()
+}
+
+// waitForBackpressure waits until the buffered records and bytes are below
+// the configured limits. It returns true if we should proceed, false if the
+// context was canceled.
+func (c *consumer) waitForBackpressure(ctx context.Context) bool {
+	maxRecords := c.cl.cfg.maxBufferedFetchRecords
+	maxBytes := c.cl.cfg.maxBufferedFetchBytes
+
+	// If no limits are configured, don't wait
+	if maxRecords <= 0 && maxBytes <= 0 {
+		return true
+	}
+
+	c.backpressureMu.Lock()
+	defer c.backpressureMu.Unlock()
+
+	for {
+		currentRecords := c.bufferedRecords.Load()
+		currentBytes := c.bufferedBytes.Load()
+
+		// Check if we're under the limits
+		underRecordLimit := maxRecords <= 0 || currentRecords < maxRecords
+		underByteLimit := maxBytes <= 0 || currentBytes < maxBytes
+
+		if underRecordLimit && underByteLimit {
+			return true
+		}
+
+		// Check if context is done
+		select {
+		case <-ctx.Done():
+			return false
+		default:
+		}
+
+		// Wait for signal that records were unbuffered
+		// We use a timed wait to periodically check the context
+		done := make(chan struct{})
+		go func() {
+			c.backpressureCond.Wait()
+			close(done)
+		}()
+
+		select {
+		case <-done:
+			// Continue loop to check limits again
+		case <-ctx.Done():
+			// Wake up the waiting goroutine so it can exit
+			c.backpressureCond.Broadcast()
+			<-done
+			return false
+		}
+	}
 }
 
 // addSourceReadyForDraining tracks that a source needs its buffered fetch

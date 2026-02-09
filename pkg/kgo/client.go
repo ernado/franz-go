@@ -384,6 +384,10 @@ func (cl *Client) OptValues(opt any) []any {
 		return []any{cfg.keepControl}
 	case namefn(MaxConcurrentFetches):
 		return []any{cfg.maxConcurrentFetches}
+	case namefn(MaxBufferedFetchRecords):
+		return []any{cfg.maxBufferedFetchRecords}
+	case namefn(MaxBufferedFetchBytes):
+		return []any{cfg.maxBufferedFetchBytes}
 	case namefn(Rack):
 		return []any{cfg.rack}
 	case namefn(KeepRetryableFetchErrors):

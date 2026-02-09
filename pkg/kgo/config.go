@@ -163,6 +163,8 @@ type cfg struct {
 	decompressor   Decompressor
 
 	maxConcurrentFetches      int
+	maxBufferedFetchRecords   int64
+	maxBufferedFetchBytes     int64
 	disableFetchSessions      bool
 	keepRetryableFetchErrors  bool
 	disableFetchCRCValidation bool
@@ -298,6 +300,12 @@ func (cfg *cfg) validate() error {
 
 		// 0 <= allowed concurrency
 		{name: "max concurrent fetches", v: int64(cfg.maxConcurrentFetches), allowed: 0, badcmp: i64lt},
+
+		// 0 <= max buffered fetch records (0 means unbounded)
+		{name: "max buffered fetch records", v: cfg.maxBufferedFetchRecords, allowed: 0, badcmp: i64lt},
+
+		// 0 <= max buffered fetch bytes (0 means unbounded)
+		{name: "max buffered fetch bytes", v: cfg.maxBufferedFetchBytes, allowed: 0, badcmp: i64lt},
 
 		// 100ms <= request timeout overhead <= 15m
 		{name: "request timeout max overhead", v: int64(cfg.requestTimeoutOverhead), allowed: int64(15 * time.Minute), badcmp: i64gt, durs: true},
@@ -1375,6 +1383,40 @@ func FetchMaxPartitionBytes(b int32) ConsumerOpt {
 // limited only by the number of brokers in the cluster.
 func MaxConcurrentFetches(n int) ConsumerOpt {
 	return consumerOpt{func(cfg *cfg) { cfg.maxConcurrentFetches = n }}
+}
+
+// MaxBufferedFetchRecords sets the maximum number of records that can be
+// buffered from fetch responses before the client stops issuing new fetch
+// requests, overriding the default of 0 (unbounded).
+//
+// This option provides backpressure when records are consumed faster than they
+// can be processed. When the number of buffered records exceeds this limit,
+// the client will wait until records are polled before issuing new fetch
+// requests.
+//
+// This option works in conjunction with MaxBufferedFetchBytes. If both are
+// set, the client waits when either limit is exceeded.
+//
+// A value of 0 implies unbounded buffering, which is the default.
+func MaxBufferedFetchRecords(n int64) ConsumerOpt {
+	return consumerOpt{func(cfg *cfg) { cfg.maxBufferedFetchRecords = n }}
+}
+
+// MaxBufferedFetchBytes sets the maximum number of bytes (sum of all record
+// keys, values, and header keys/values) that can be buffered from fetch
+// responses before the client stops issuing new fetch requests, overriding
+// the default of 0 (unbounded).
+//
+// This option provides backpressure when records are consumed faster than they
+// can be processed. When the number of buffered bytes exceeds this limit, the
+// client will wait until records are polled before issuing new fetch requests.
+//
+// This option works in conjunction with MaxBufferedFetchRecords. If both are
+// set, the client waits when either limit is exceeded.
+//
+// A value of 0 implies unbounded buffering, which is the default.
+func MaxBufferedFetchBytes(n int64) ConsumerOpt {
+	return consumerOpt{func(cfg *cfg) { cfg.maxBufferedFetchBytes = n }}
 }
 
 // ConsumeStartOffset sets the offset to start consuming from when consuming a

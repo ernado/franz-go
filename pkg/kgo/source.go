@@ -434,6 +434,8 @@ func (s *source) hook(f *Fetch, buffered, polled bool) {
 	} else {
 		s.cl.consumer.bufferedRecords.Add(-int64(nrecs))
 		s.cl.consumer.bufferedBytes.Add(-nbytes)
+		// Signal that records were unbuffered to allow blocked fetches to proceed
+		s.cl.consumer.signalBackpressure()
 	}
 }
 
@@ -768,6 +770,14 @@ func (s *source) loopFetch() {
 
 	again := true
 	for again {
+		// Wait for backpressure to clear before attempting to fetch.
+		// This prevents memory buildup when records are consumed faster
+		// than they can be processed.
+		if !consumer.waitForBackpressure(session.ctx) {
+			s.fetchState.hardFinish()
+			return
+		}
+
 		select {
 		case <-session.ctx.Done():
 			s.fetchState.hardFinish()
